@@ -22,11 +22,7 @@ import { uid } from '@/lib/uid'
 import { formatLength } from '@/lib/format'
 import GridLayer from './GridLayer.vue'
 import Rulers from './Rulers.vue'
-import WallShape from '@/components/svg/WallShape.vue'
-import DoorShape from '@/components/svg/DoorShape.vue'
-import WindowShape from '@/components/svg/WindowShape.vue'
-import FurnitureShape from '@/components/svg/FurnitureShape.vue'
-import DimensionShape from '@/components/svg/DimensionShape.vue'
+import WorldElement from '@/components/svg/WorldElement.vue'
 import RoomFaceShape from '@/components/svg/RoomFace.vue'
 import OpeningsMask from '@/components/svg/OpeningsMask.vue'
 import type {
@@ -52,8 +48,8 @@ const angleDimHover = ref<{ vertex: Pt; r1: Pt; r2: Pt } | null>(null)
 
 /** 标记本次指针拖拽是否已提交历史快照（拖拽开始入栈一次） */
 let dragHistPushed = false
-/** Shift 是否临时禁用角度锁定（自由角度微调） */
-let freeAngle = false
+/** Shift 是否临时禁用角度锁定（自由角度微调）；ref 以便画墙角度标签响应 */
+const freeAngle = ref(false)
 function beginDragMutation() {
   if (!dragHistPushed) {
     editor.pushHistory()
@@ -83,6 +79,9 @@ const dims = computed(() => state.doc.elements.filter((e): e is DimensionElement
 const furniture = computed(() => state.doc.elements.filter((e): e is FurnitureElement => e.kind === 'furniture'))
 
 const wallMap = computed(() => new Map(walls.value.map((w) => [w.id, w])))
+
+/** 渲染顺序即文档数组顺序（层级调整据此生效，跨类型也成立） */
+const orderedElements = computed(() => state.doc.elements)
 
 // ---------------------------------------------------------------------------
 // 指针交互状态机
@@ -124,6 +123,7 @@ watch(
     angleDimHover.value = null
     measureFirst.value = null
     rawState.snapMarker = null
+    freeAngle.value = false
   }
 )
 
@@ -162,7 +162,7 @@ function setSnapMarker(hit: SnapHit | null) {
 function applyAngleLock(prev: Pt, raw: Pt, shift: boolean): Pt {
   if (shift) return raw
   const s = state.doc.settings
-  if (s.angleLock45) return angleLockPoint(prev, raw, true, 45, 12)
+  if (s.angleLock45) return angleLockPoint(prev, raw, true, 45, 15)
   if (s.ortho) return angleLockPoint(prev, raw, true, 90, 18)
   return raw
 }
@@ -200,7 +200,7 @@ function onPointerDown(e: PointerEvent) {
   }
   if (e.button !== 0) return
   const w = toWorld(e)
-  freeAngle = e.shiftKey
+  freeAngle.value = e.shiftKey
   containerRef.value?.setPointerCapture?.(e.pointerId)
 
   switch (state.mode) {
@@ -362,7 +362,7 @@ function handleWallClick(e: PointerEvent, wRaw: Pt) {
 
 function updateWallHover(e: PointerEvent, wRaw: Pt) {
   const draft = rawState.wallDraft
-  freeAngle = e.shiftKey
+  freeAngle.value = e.shiftKey
   if (draft.length === 0) {
     const s = applySnap(wRaw)
     setSnapMarker(s.hit)
@@ -666,7 +666,7 @@ function orthoVertex(e: PointerEvent, wall: WallElement, index: number, p: Pt): 
     if (Math.abs(dx) > Math.abs(dy)) return { x: p.x, y: ref.y }
     return { x: ref.x, y: p.y }
   }
-  return angleLockPoint(ref, p, true, 45, 12)
+  return angleLockPoint(ref, p, true, 45, 15)
 }
 
 function doOpeningMove(w: Pt, d: Extract<DragState, { kind: 'opening' }>) {
@@ -938,6 +938,7 @@ function onKeyDown(e: KeyboardEvent) {
 
 function onKeyUp(e: KeyboardEvent) {
   if (e.code === 'Space') spaceDown = false
+  if (e.key === 'Shift') freeAngle.value = false
 }
 
 // ---------------------------------------------------------------------------
@@ -953,6 +954,30 @@ const draftWall = computed(() => {
   return {
     center: wallOutlinePath(all, state.doc.settings.wallThickness, false),
     line: all.map((p) => `${p.x},${p.y}`).join(' ')
+  }
+})
+
+/** 画墙当前段的实时角度/长度（自由微调时可见角度变化） */
+const draftSegInfo = computed(() => {
+  const pts = state.wallDraft
+  if (!pts.length || !wallCursor.value) return null
+  const a = pts[pts.length - 1]
+  const b = wallCursor.value
+  const len = Math.hypot(b.x - a.x, b.y - a.y)
+  if (len < 1) return null
+  const isFree = freeAngle.value
+  // 与 applyAngleLock 相同的锁定结果，用于判断当前段是否被锁定
+  const lockedPt = applyAngleLock(a, b, isFree)
+  let lockedDeg = (Math.atan2(lockedPt.y - a.y, lockedPt.x - a.x) * 180) / Math.PI
+  lockedDeg = ((lockedDeg % 180) + 180) % 180
+  let deg = (Math.atan2(b.y - a.y, b.x - a.x) * 180) / Math.PI
+  deg = ((deg % 180) + 180) % 180
+  const isLocked = !isFree && Math.abs(deg - lockedDeg) < 0.01
+  return {
+    len,
+    deg,
+    mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+    locked: isLocked
   }
 })
 
@@ -1018,9 +1043,9 @@ function zoomOut() {
   zoomByFactor(1 / 1.2, { x: viewW.value / 2, y: viewH.value / 2 })
 }
 function zoomReset() {
-  rawState.viewport.scale = 0.5
-  rawState.viewport.tx = 400
-  rawState.viewport.ty = 300
+  rawState.viewport.scale = 0.28
+  rawState.viewport.tx = 460
+  rawState.viewport.ty = 360
 }
 function fitAll() {
   if (state.doc.elements.length === 0) return
@@ -1135,49 +1160,14 @@ function inRect(p: Pt, r: { x: number; y: number; width: number; height: number 
         <!-- 房间面（最底层） -->
         <RoomFaceShape v-for="r in editor.rooms.value" :key="r.id" :room="r" :scale="scale" />
 
-        <!-- 墙体 -->
-        <WallShape
-          v-for="w in walls"
-          :key="w.id"
-          :wall="w"
-          :selected="state.selection.has(w.id)"
+        <!-- 所有图元：严格按 elements 数组顺序绘制，数组顺序即层级 -->
+        <WorldElement
+          v-for="el in orderedElements"
+          :key="el.id"
+          :el="el"
+          :selected="state.selection.has(el.id)"
           :scale="scale"
-        />
-
-        <!-- 门窗 -->
-        <DoorShape
-          v-for="d in doors"
-          :key="d.id"
-          :wall="wallMap.get(d.wallId)!"
-          :door="d"
-          :selected="state.selection.has(d.id)"
-          :scale="scale"
-        />
-        <WindowShape
-          v-for="win in windows"
-          :key="win.id"
-          :wall="wallMap.get(win.wallId)!"
-          :win="win"
-          :selected="state.selection.has(win.id)"
-          :scale="scale"
-        />
-
-        <!-- 家具 -->
-        <FurnitureShape
-          v-for="f in furniture"
-          :key="f.id"
-          :furniture="f"
-          :selected="state.selection.has(f.id)"
-          :scale="scale"
-        />
-
-        <!-- 标注 -->
-        <DimensionShape
-          v-for="dim in dims"
-          :key="dim.id"
-          :dim="dim"
-          :selected="state.selection.has(dim.id)"
-          :scale="scale"
+          :wall-map="wallMap"
         />
 
         <!-- 画墙预览 -->
@@ -1190,6 +1180,24 @@ function inRect(p: Pt, r: { x: number; y: number; width: number; height: number 
             :stroke-width="1.5 / scale"
             :stroke-dasharray="`${8 / scale} ${6 / scale}`"
           />
+          <g v-if="draftSegInfo">
+            <rect
+              :x="draftSegInfo.mid.x - 360"
+              :y="draftSegInfo.mid.y - 150"
+              width="720"
+              height="240"
+              rx="40"
+              :fill="draftSegInfo.locked ? 'rgba(64,158,255,0.92)' : 'rgba(103,194,58,0.92)'"
+            />
+            <text
+              :x="draftSegInfo.mid.x"
+              :y="draftSegInfo.mid.y - 30"
+              :font-size="150"
+              fill="#fff"
+              text-anchor="middle"
+              dominant-baseline="central"
+            >{{ Math.round(draftSegInfo.len) }}　{{ draftSegInfo.deg.toFixed(1) }}°{{ draftSegInfo.locked ? ' · 锁定' : ' · 自由' }}</text>
+          </g>
         </g>
 
         <!-- 吸附标记：端点=方框，中点=菱形，交点=十字圆 -->

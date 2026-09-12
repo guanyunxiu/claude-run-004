@@ -11,13 +11,9 @@ export const EXPORT_SCALE = 0.5
  */
 import { computed } from 'vue'
 import { useEditor } from '@/store/useEditor'
-import type { DimensionElement, DoorElement, FurnitureElement, WallElement, WindowElement } from '@/types'
+import type { DoorElement, WallElement, WindowElement } from '@/types'
 import OpeningsMask from '@/components/svg/OpeningsMask.vue'
-import WallShape from '@/components/svg/WallShape.vue'
-import DoorShape from '@/components/svg/DoorShape.vue'
-import WindowShape from '@/components/svg/WindowShape.vue'
-import FurnitureShape from '@/components/svg/FurnitureShape.vue'
-import DimensionShape from '@/components/svg/DimensionShape.vue'
+import WorldElement from '@/components/svg/WorldElement.vue'
 import RoomFaceShape from '@/components/svg/RoomFace.vue'
 
 const editor = useEditor()
@@ -27,8 +23,6 @@ const scale = computed(() => EXPORT_SCALE)
 const walls = computed(() => state.doc.elements.filter((e): e is WallElement => e.kind === 'wall'))
 const doors = computed(() => state.doc.elements.filter((e): e is DoorElement => e.kind === 'door'))
 const windows = computed(() => state.doc.elements.filter((e): e is WindowElement => e.kind === 'window'))
-const dims = computed(() => state.doc.elements.filter((e): e is DimensionElement => e.kind === 'dimension'))
-const furniture = computed(() => state.doc.elements.filter((e): e is FurnitureElement => e.kind === 'furniture'))
 const wallMap = computed(() => new Map(walls.value.map((w) => [w.id, w])))
 </script>
 
@@ -44,36 +38,13 @@ const wallMap = computed(() => new Map(walls.value.map((w) => [w.id, w])))
     <g class="world-content" transform="scale(0.5)">
       <OpeningsMask :walls="walls" :doors="doors" :windows="windows" />
       <RoomFaceShape v-for="r in editor.rooms.value" :key="r.id" :room="r" :scale="scale" />
-      <WallShape v-for="w in walls" :key="w.id" :wall="w" :selected="false" :scale="scale" />
-      <DoorShape
-        v-for="d in doors"
-        :key="d.id"
-        :wall="wallMap.get(d.wallId)!"
-        :door="d"
+      <WorldElement
+        v-for="el in state.doc.elements"
+        :key="el.id"
+        :el="el"
         :selected="false"
         :scale="scale"
-      />
-      <WindowShape
-        v-for="win in windows"
-        :key="win.id"
-        :wall="wallMap.get(win.wallId)!"
-        :win="win"
-        :selected="false"
-        :scale="scale"
-      />
-      <FurnitureShape
-        v-for="f in furniture"
-        :key="f.id"
-        :furniture="f"
-        :selected="false"
-        :scale="scale"
-      />
-      <DimensionShape
-        v-for="dim in dims"
-        :key="dim.id"
-        :dim="dim"
-        :selected="false"
-        :scale="scale"
+        :wall-map="wallMap"
       />
     </g>
   </svg>

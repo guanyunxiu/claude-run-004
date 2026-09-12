@@ -116,15 +116,15 @@ const tWalls = [
   check('45°锁定:45°保持', approx(p.x, 1000) && approx(p.y, 1000))
 }
 {
-  // 30° 距 0° 和 45° 均超过 12° 阈值 => 保持自由
-  const raw = { x: Math.cos(Math.PI / 6) * 1000, y: Math.sin(Math.PI / 6) * 1000 }
-  const p = lib.angleLockPoint({ x: 0, y: 0 }, raw, true, 45, 12)
+  // 30° 距 0°/45° 均为 15°/15°，取中点附近 28°（距两者均 >15° 中最近 0° 为 28°）=> 保持自由
+  const raw = { x: Math.cos((28 * Math.PI) / 180) * 1000, y: Math.sin((28 * Math.PI) / 180) * 1000 }
+  const p = lib.angleLockPoint({ x: 0, y: 0 }, raw, true, 45, 15)
   check('45°锁定:中间角度自由微调', approx(p.x, raw.x, 1) && approx(p.y, raw.y, 1), JSON.stringify(p))
 }
 {
-  // 8° 距 0° 小于 12° => 吸附到水平
-  const p = lib.angleLockPoint({ x: 0, y: 0 }, { x: 1000, y: 140 }, true, 45, 12)
-  check('45°锁定:8°内吸附到固定方向', approx(p.y, 0, 1), JSON.stringify(p))
+  // 8° 距 0° 小于 15° => 吸附到水平
+  const p = lib.angleLockPoint({ x: 0, y: 0 }, { x: 1000, y: 140 }, true, 45, 15)
+  check('45°锁定:阈值内吸附到固定方向', approx(p.y, 0, 1), JSON.stringify(p))
 }
 
 // ---------------------------------------------------------------- 3. 相交裁剪
@@ -256,14 +256,22 @@ const tWalls = [
   const back = lib.sendToBack(els, new Set(['c'])).map((e) => e.id)
   check('置底', back.join('') === 'cab')
   const up = lib.moveUp(els, new Set(['a'])).map((e) => e.id)
-  check('同类型上移', up.join('') === 'bac')
-  // 不同类型不跨类型交换
+  check('上移一层', up.join('') === 'bac')
+  // 跨类型也应交换（画布按数组顺序统一渲染）
   const mixed = [
     { id: 'w', kind: 'wall' },
     { id: 'f', kind: 'furniture' }
   ]
   const moved = lib.moveUp(mixed, new Set(['w'])).map((e) => e.id)
-  check('上移不跨类型', moved.join('') === 'wf')
+  check('上移可跨类型', moved.join('') === 'fw')
+  const movedDown = lib.moveDown(
+    [
+      { id: 'w', kind: 'wall' },
+      { id: 'f', kind: 'furniture' }
+    ],
+    new Set(['f'])
+  ).map((e) => e.id)
+  check('下移可跨类型', movedDown.join('') === 'fw')
 }
 
 // ---------------------------------------------------------------- 8. 剪贴板

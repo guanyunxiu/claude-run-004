@@ -220,10 +220,10 @@ function del() {
           <el-button size="small" plain @click="editor.duplicateSelected()">副本</el-button>
         </div>
         <div class="btn-grid">
-          <el-button size="small" plain title="上移一层（同类型内）" @click="reorder('up')">上移</el-button>
-          <el-button size="small" plain title="下移一层（同类型内）" @click="reorder('down')">下移</el-button>
-          <el-button size="small" plain title="置于顶层" @click="reorder('front')">置顶</el-button>
-          <el-button size="small" plain title="置于底层" @click="reorder('back')">置底</el-button>
+          <el-button size="small" plain title="在所有图元中上移一层" @click="reorder('up')">上移</el-button>
+          <el-button size="small" plain title="在所有图元中下移一层" @click="reorder('down')">下移</el-button>
+          <el-button size="small" plain title="置于所有图元最顶层" @click="reorder('front')">置顶</el-button>
+          <el-button size="small" plain title="置于所有图元最底层" @click="reorder('back')">置底</el-button>
         </div>
       </div>
     </template>

@@ -84,7 +84,7 @@ const state = reactive<EditorState>({
   doc: createDoc(),
   mode: 'select',
   selection: new Set(),
-  viewport: { scale: 0.5, tx: 400, ty: 300 },
+  viewport: { scale: 0.28, tx: 460, ty: 360 },
   rulerSize: 24,
   cursorWorld: null,
   measure: null,

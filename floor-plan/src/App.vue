@@ -59,20 +59,26 @@ function onDragOver(e: DragEvent) {
   if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
 }
 
+const placeSeq = ref(0)
+
 function placeFurniture(defId: string, world?: Pt) {
   const def = getFurnitureDef(defId)
   if (!def) return
   let x = world?.x ?? 0
   let y = world?.y ?? 0
   if (!world && canvasRef.value) {
-    // 点击家具库按钮：放到当前视图中心
+    // 点击家具库按钮：放到当前视图中心，并带阶梯偏移避免多次放置完全重叠
     const el = canvasRef.value.containerRef as HTMLDivElement
     const rect = el.getBoundingClientRect()
     const cx = rect.left + rect.width / 2
     const cy = rect.top + rect.height / 2
     const w = useViewport().screenToWorld(cx, cy, rect)
-    x = w.x
-    y = w.y
+    const step = (placeSeq.value % 6) * 120
+    x = w.x + step
+    y = w.y + step
+    placeSeq.value++
+  } else {
+    placeSeq.value = 0
   }
   editor.pushHistory()
   const f = editor.makeFurniture(defId, x, y, def.width, def.height)

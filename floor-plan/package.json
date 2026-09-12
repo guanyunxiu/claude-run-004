@@ -10,6 +10,7 @@
     "preview": "vite preview",
     "test:lib": "node scripts/features.test.mjs",
     "test:store": "node scripts/store.test.mjs",
+    "test:layer": "node scripts/layering.test.mjs",
     "test:e2e": "node scripts/features.e2e.mjs",
     "test:smoke": "node scripts/smoke.mjs"
   },
