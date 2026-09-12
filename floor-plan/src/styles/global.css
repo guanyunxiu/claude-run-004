@@ -1,0 +1,29 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  background: #f0f2f5;
+  user-select: none;
+}
+
+button {
+  font-family: inherit;
+}
+
+:root {
+  --fp-wall: #303133;
+  --fp-accent: #409eff;
+  --fp-measure: #f56c6c;
+  --fp-panel-bg: #ffffff;
+  --fp-border: #e4e7ed;
+}

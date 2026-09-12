@@ -1,0 +1,31 @@
+{
+  "name": "floor-plan",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "typecheck": "vue-tsc --noEmit",
+    "preview": "vite preview",
+    "test:lib": "node scripts/features.test.mjs",
+    "test:store": "node scripts/store.test.mjs",
+    "test:e2e": "node scripts/features.e2e.mjs",
+    "test:smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.1",
+    "element-plus": "^2.7.6",
+    "html2canvas": "^1.4.1",
+    "lodash-es": "^4.17.21",
+    "vue": "^3.4.31"
+  },
+  "devDependencies": {
+    "@types/lodash-es": "^4.17.6",
+    "@vitejs/plugin-vue": "^5.0.5",
+    "playwright": "^1.63.0",
+    "typescript": "^5.4.5",
+    "vite": "^5.3.3",
+    "vue-tsc": "^2.0.26"
+  }
+}
