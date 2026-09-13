@@ -253,6 +253,77 @@ export const FURNITURE_DEFS: FurnitureDef[] = [
 
 const defMap = new Map(FURNITURE_DEFS.map((d) => [d.id, d]))
 
-export function getFurnitureDef(id: string): FurnitureDef | undefined {
-  return defMap.get(id)
+/** 自定义家具存储键（localStorage） */
+const CUSTOM_STORAGE_KEY = 'fp.custom-furniture.v1'
+
+/** 载入用户自定义家具定义 */
+export function loadCustomFurniture(): FurnitureDef[] {
+  try {
+    const raw = localStorage.getItem(CUSTOM_STORAGE_KEY)
+    if (!raw) return []
+    const arr = JSON.parse(raw) as FurnitureDef[]
+    if (!Array.isArray(arr)) return []
+    return arr.filter((d) => d && d.id && d.body != null && d.width > 0 && d.height > 0)
+  } catch {
+    return []
+  }
 }
+
+/** 持久化用户自定义家具 */
+export function saveCustomFurniture(defs: FurnitureDef[]): void {
+  try {
+    localStorage.setItem(CUSTOM_STORAGE_KEY, JSON.stringify(defs))
+  } catch {
+    /* 存储不可用时静默忽略 */
+  }
+}
+
+/** 校验/规整一段自定义 SVG 片段，包裹为 100x100 视口的 body */
+export function normalizeCustomBody(rawSvg: string): string {
+  const s = (rawSvg || '').trim()
+  if (!s) return ''
+  // 已是纯片段（rect/path/circle...）：直接返回
+  if (!s.startsWith('<svg')) return s
+  // 提取 <svg>…</svg> 内部内容
+  const inner = s.replace(/<\?xml[^?]*\?>/g, '').match(/<svg[^>]*>([\s\S]*)<\/svg>/i)
+  return inner ? inner[1].trim() : s
+}
+
+let customDefs: FurnitureDef[] = loadCustomFurniture()
+const customMap = new Map(customDefs.map((d) => [d.id, d]))
+
+/** 添加一条自定义家具定义并持久化 */
+export function addCustomFurniture(def: Omit<FurnitureDef, 'vb' | 'category'> & { category?: FurnitureCategory }): FurnitureDef {
+  const full: FurnitureDef = {
+    ...def,
+    vb: VB,
+    category: def.category ?? 'table',
+    body: normalizeCustomBody(def.body)
+  }
+  // 去重替换
+  customDefs = customDefs.filter((d) => d.id !== full.id)
+  customDefs.push(full)
+  customMap.set(full.id, full)
+  saveCustomFurniture(customDefs)
+  return full
+}
+
+export function removeCustomFurniture(id: string): void {
+  customDefs = customDefs.filter((d) => d.id !== id)
+  customMap.delete(id)
+  saveCustomFurniture(customDefs)
+}
+
+export function getCustomFurniture(): FurnitureDef[] {
+  return customDefs
+}
+
+export function getFurnitureDef(id: string): FurnitureDef | undefined {
+  return defMap.get(id) ?? customMap.get(id)
+}
+
+/** 是否为用户自定义家具 */
+export function isCustomFurniture(id: string): boolean {
+  return customMap.has(id)
+}
+

@@ -20,6 +20,7 @@ export { syncDimensions, findAnchorAt, anchorFromSnap } from './src/lib/dimensio
 export { bringToFront, sendToBack, moveUp, moveDown } from './src/lib/layering'
 export { setClipboard, pasteElements, hasClipboard } from './src/lib/clipboard'
 export { hitTest } from './src/lib/hit'
+export { nearestWallForOpening } from './src/lib/openings'
 `
 writeFileSync(entryPath, entry)
 
@@ -307,6 +308,38 @@ const tWalls = [
   // 弧中点（45°，半径500）≈ (353.5,353.5)
   const hitArc = lib.hitTest([d], { x: 354, y: 354 }, 30)
   check('角度标注命中弧半径手柄', hitArc?.handle === 'arc', JSON.stringify(hitArc))
+}
+
+// ---------------------------------------------------------------- 10. 门窗放置距离
+{
+  const w1 = wall('pw', [{ x: 0, y: 0 }, { x: 4000, y: 0 }], 120)
+  // 紧贴墙（60mm 半墙厚内）
+  check('近墙可放置', !!lib.nearestWallForOpening({ x: 1000, y: 100 }, [w1]))
+  // 半墙厚 60 + 容差 250 = 310 以内
+  check('310mm 内可放置', !!lib.nearestWallForOpening({ x: 1000, y: 305 }, [w1]))
+  // 离墙 1000mm 不允许
+  check('离墙 1000mm 拒绝放置', lib.nearestWallForOpening({ x: 1000, y: 1000 }, [w1]) === null)
+  // 无墙时拒绝
+  check('无墙拒绝放置', lib.nearestWallForOpening({ x: 0, y: 0 }, []) === null)
+}
+
+// ---------------------------------------------------------------- 11. 标注偏移线命中
+{
+  // p1=(0,0) p2=(2000,0)，offsetDistance=400，法向 (0,1)：标注线在 y=400
+  const d = {
+    id: 'ld', kind: 'dimension', dimType: 'linear',
+    p1: { x: 0, y: 0 }, p2: { x: 2000, y: 0 },
+    offsetDistance: 400, color: '#f00', strokeWidth: 1
+  }
+  // 点中偏移线（非端点）应返回 kind=dimension, handle=offset（用于拖偏移，而非整体平移）
+  const hitLine = lib.hitTest([d], { x: 1000, y: 400 }, 20)
+  check('点标注线 => offset 拖拽', hitLine?.id === 'ld' && hitLine?.handle === 'offset', JSON.stringify(hitLine))
+  // 端点手柄优先
+  const hitP1 = lib.hitTest([d], { x: 0, y: 0 }, 20)
+  check('点端点 => start 手柄', hitP1?.handle === 'start')
+  // 引线也能拖整体（无 handle）
+  const hitExt = lib.hitTest([d], { x: 0, y: 200 }, 20)
+  check('点引线 => 整段移动(无offset handle)', hitExt?.id === 'ld' && hitExt?.handle !== 'offset', JSON.stringify(hitExt))
 }
 
 console.log(`\n${pass} passed, ${fail} failed`)

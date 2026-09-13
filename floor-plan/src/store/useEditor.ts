@@ -10,6 +10,9 @@ import type {
   FloorElement,
   FurnitureElement,
   RoomFace,
+  RoomMeta,
+  StructureElement,
+  StructureKind,
   ToolMode,
   WallElement,
   WindowElement
@@ -21,13 +24,22 @@ import { polylineLength } from '@/lib/geometry'
 import { syncDimensions, migrateDimension } from '@/lib/dimensionSync'
 import {
   batchEditWalls,
+  canJoinWalls,
+  findSplitPoint,
   healWalls,
+  insertVertex,
+  joinWalls,
   rehomeOpenings,
+  removeVertex,
+  splitWallAt,
   trimWallsAtIntersections,
   type OpeningLike
 } from '@/lib/wallOps'
 import { pasteElements, setClipboard } from '@/lib/clipboard'
 import { bringToFront, sendToBack, moveUp, moveDown } from '@/lib/layering'
+import { alignElements, distributeElements, makeArrayCopies } from '@/lib/layout'
+import type { AlignMode, DistributeMode, ArrayOptions } from '@/lib/layout'
+import { roomSignature, attachRoomMeta, roomNetArea, createRoomMeta } from '@/lib/roomMeta'
 
 const DEFAULT_SETTINGS: DocSettings = {
   wallColor: '#303133',
@@ -45,7 +57,9 @@ const DEFAULT_SETTINGS: DocSettings = {
   snapEndpoint: true,
   snapMidpoint: true,
   snapIntersection: true,
-  autoTrim: false
+  autoTrim: false,
+  furnitureSnap: true,
+  collisionBlock: false
 }
 
 function createDoc(): DocModel {
@@ -67,6 +81,8 @@ interface EditorState {
   doc: DocModel
   mode: ToolMode
   selection: Set<string>
+  /** 当前选中的房间面 id（房间由墙体推导，不在 elements 中） */
+  selectedRoomId: string | null
   viewport: Viewport
   /** 标尺占用边距 */
   rulerSize: number
@@ -84,6 +100,7 @@ const state = reactive<EditorState>({
   doc: createDoc(),
   mode: 'select',
   selection: new Set(),
+  selectedRoomId: null,
   viewport: { scale: 0.28, tx: 460, ty: 360 },
   rulerSize: 24,
   cursorWorld: null,
@@ -219,6 +236,10 @@ function toggleSelect(id: string) {
   else state.selection.add(id)
 }
 
+function selectRoom(id: string | null) {
+  state.selectedRoomId = id
+}
+
 const selectedElements = computed<FloorElement[]>(() =>
   state.doc.elements.filter((e) => state.selection.has(e.id))
 )
@@ -230,19 +251,35 @@ const walls = computed<WallElement[]>(() =>
   state.doc.elements.filter((e): e is WallElement => e.kind === 'wall')
 )
 
+const structures = computed<StructureElement[]>(() =>
+  state.doc.elements.filter((e): e is StructureElement => e.kind === 'structure')
+)
+
 const rooms = computed<RoomFace[]>(() => {
   try {
-    return extractRooms(walls.value).map((r, i) => ({
-      id: `room_${i}`,
-      points: r.points,
-      area: r.area,
-      perimeter: r.perimeter,
-      wallIds: r.wallIds
-    }))
+    const list = extractRooms(walls.value).map((r, i) => {
+      const face: RoomFace = {
+        id: `room_${i}`,
+        points: r.points,
+        area: r.area,
+        perimeter: r.perimeter,
+        wallIds: r.wallIds,
+        sig: roomSignature(r.points),
+        netArea: r.area
+      }
+      face.netArea = roomNetArea(r.points, structures.value)
+      return face
+    })
+    attachRoomMeta(list, state.doc.roomMeta ?? [])
+    return list
   } catch {
     return []
   }
 })
+
+const selectedRoom = computed<RoomFace | null>(
+  () => rooms.value.find((r) => r.id === state.selectedRoomId) ?? null
+)
 
 // ---------------------------------------------------------------------------
 // 便捷工厂
@@ -260,6 +297,29 @@ function makeWall(points: Pt[], closed = false): WallElement {
 
 function makeFurniture(defId: string, x: number, y: number, width: number, height: number): FurnitureElement {
   return { id: uid('fur'), kind: 'furniture', defId, x, y, width, height, rotation: 0 }
+}
+
+const STRUCTURE_DEFAULTS: Record<StructureKind, { w: number; h: number; color: string; deduct: boolean; label: string }> = {
+  column: { w: 400, h: 400, color: '#303133', deduct: true, label: '柱' },
+  flue: { w: 500, h: 500, color: '#909399', deduct: true, label: '烟道' },
+  platform: { w: 2000, h: 600, color: '#d4b896', deduct: false, label: '地台' }
+}
+
+function makeStructure(kind: StructureKind, x: number, y: number): StructureElement {
+  const d = STRUCTURE_DEFAULTS[kind]
+  return {
+    id: uid('st'),
+    kind: 'structure',
+    structKind: kind,
+    x,
+    y,
+    width: d.w,
+    height: d.h,
+    rotation: 0,
+    color: d.color,
+    deduct: d.deduct,
+    label: d.label
+  }
 }
 
 function makeDimension(p1: Pt, p2: Pt, offsetDistance = 400): DimensionElement {
@@ -421,9 +481,9 @@ function pasteAt(offset?: Pt): FloorElement[] {
 }
 
 function duplicateSelected(): void {
-  const els = state.doc.elements.filter((e) => state.selection.has(e.id))
-  if (els.length === 0) return
-  setClipboard(els)
+  if (state.selection.size === 0) return
+  // 与复制一致：复制墙时带上依附其上的门窗（仅复制不剪切）
+  copySelected(false)
   pasteAt({ x: 200, y: 200 })
 }
 
@@ -433,6 +493,132 @@ function reorderSelected(dir: 'front' | 'back' | 'up' | 'down') {
   pushHistory()
   const fn = dir === 'front' ? bringToFront : dir === 'back' ? sendToBack : dir === 'up' ? moveUp : moveDown
   state.doc.elements = fn(state.doc.elements, ids)
+}
+
+// ---------------------------------------------------------------------------
+// 手动墙编辑：插入/删除顶点、打断、合并
+// ---------------------------------------------------------------------------
+function wallInsertVertex(wallId: string, p: Pt, tolMm: number): number {
+  const w = state.doc.elements.find((e): e is WallElement => e.id === wallId && e.kind === 'wall')
+  if (!w) return -1
+  pushHistory()
+  return insertVertex(w, p, tolMm)
+}
+
+function wallRemoveVertex(wallId: string, index: number): boolean {
+  const w = state.doc.elements.find((e): e is WallElement => e.id === wallId && e.kind === 'wall')
+  if (!w) return false
+  pushHistory()
+  return removeVertex(w, index)
+}
+
+/** 打断墙（直接操作真实门窗元素，保证归属正确） */
+function splitWall(wallId: string, p: Pt, tolMm: number): WallElement | null {
+  const w = state.doc.elements.find((e): e is WallElement => e.id === wallId && e.kind === 'wall')
+  if (!w || w.closed) return null
+  const sp = findSplitPoint(w, p, tolMm)
+  if (!sp) return null
+  pushHistory()
+  const liveOpenings = state.doc.elements.filter(
+    (e): e is DoorElement | WindowElement => (e.kind === 'door' || e.kind === 'window') && e.wallId === wallId
+  )
+  const openings: OpeningLike[] = liveOpenings.map((o) => ({ wallId: o.wallId, offset: o.offset, width: o.width }))
+  const newWall = splitWallAt(w, sp.dist, sp.point, openings, () => uid('wall'))
+  liveOpenings.forEach((el, i) => {
+    el.wallId = openings[i].wallId
+    el.offset = openings[i].offset
+  })
+  state.doc.elements.push(newWall)
+  selectOnly([w.id, newWall.id])
+  return newWall
+}
+
+/** 手动合并两面墙（取选中的前两面可合并的开放墙） */
+function joinSelectedWalls(tolMm = 300): boolean {
+  const ws = selectedElements.value.filter((e): e is WallElement => e.kind === 'wall' && !e.closed)
+  if (ws.length < 2) return false
+  // 找到一对端点相接且同厚的墙
+  let pair: [WallElement, WallElement] | null = null
+  outer: for (let i = 0; i < ws.length; i++) {
+    for (let j = i + 1; j < ws.length; j++) {
+      if (canJoinWalls(ws[i], ws[j], tolMm)) {
+        pair = [ws[i], ws[j]]
+        break outer
+      }
+    }
+  }
+  if (!pair) return false
+  const [a, b] = pair
+  const liveOpenings = state.doc.elements.filter(
+    (e): e is DoorElement | WindowElement => e.kind === 'door' || e.kind === 'window'
+  )
+  const openings: OpeningLike[] = liveOpenings.map((o) => ({ wallId: o.wallId, offset: o.offset, width: o.width }))
+  const res = joinWalls(a, b, openings)
+  if (!res) return false
+  pushHistory()
+  liveOpenings.forEach((el, i) => {
+    el.wallId = openings[i].wallId
+    el.offset = openings[i].offset
+  })
+  state.doc.elements = state.doc.elements.filter((e) => e.id !== res.removedId)
+  state.selection.delete(res.removedId)
+  pruneSelection()
+  return true
+}
+
+// ---------------------------------------------------------------------------
+// 对齐 / 分布 / 阵列（家具 + 结构）
+// ---------------------------------------------------------------------------
+function movableSelection(): (FurnitureElement | StructureElement)[] {
+  return selectedElements.value.filter(
+    (e): e is FurnitureElement | StructureElement => e.kind === 'furniture' || e.kind === 'structure'
+  )
+}
+function alignSelected(mode: AlignMode) {
+  const els = movableSelection()
+  if (els.length < (mode === 'hcenter' || mode === 'vcenter' ? 1 : 2)) return
+  pushHistory()
+  alignElements(els, mode)
+}
+function distributeSelected(mode: DistributeMode) {
+  const els = movableSelection()
+  if (els.length < 3) return
+  pushHistory()
+  distributeElements(els, mode)
+}
+function arraySelected(opts: ArrayOptions): number {
+  const proto = movableSelection()[0]
+  if (!proto || opts.count < 2) return 0
+  pushHistory()
+  const copies = makeArrayCopies(proto, opts, () => uid(proto.kind === 'structure' ? 'st' : 'fur'))
+  state.doc.elements.push(...(copies as FloorElement[]))
+  selectOnly(copies.map((c) => c.id))
+  return copies.length
+}
+
+// ---------------------------------------------------------------------------
+// 房间命名 / 填充 / 标签
+// ---------------------------------------------------------------------------
+function getOrCreateRoomMeta(room: RoomFace): RoomMeta {
+  if (!state.doc.roomMeta) state.doc.roomMeta = []
+  let meta = state.doc.roomMeta.find((m) => m.sig === room.sig)
+  if (!meta) {
+    meta = createRoomMeta(room.sig)
+    state.doc.roomMeta.push(meta)
+  }
+  return meta
+}
+function setRoomName(room: RoomFace, name: string) {
+  pushHistory()
+  getOrCreateRoomMeta(room).name = name
+}
+function setRoomFill(room: RoomFace, fill: string) {
+  pushHistory()
+  getOrCreateRoomMeta(room).fill = fill
+}
+function setRoomLabelPos(room: RoomFace, p: Pt) {
+  // 拖动标签（拖拽内会自行 pushHistory）
+  getOrCreateRoomMeta(room).labelPos = { ...p }
 }
 
 // ---------------------------------------------------------------------------
@@ -471,8 +657,11 @@ export function useEditor() {
     getElement,
     selectOnly,
     toggleSelect,
+    selectRoom,
+    selectedRoom,
     makeWall,
     makeFurniture,
+    makeStructure,
     makeDimension,
     makeAngleDimension,
     setMode,
@@ -484,6 +673,21 @@ export function useEditor() {
     trimIntersectingWalls,
     healBrokenWalls,
     batchEditSelectedWalls,
+    // 手动墙编辑
+    wallInsertVertex,
+    wallRemoveVertex,
+    splitWall,
+    joinSelectedWalls,
+    // 对齐 / 分布 / 阵列
+    alignSelected,
+    distributeSelected,
+    arraySelected,
+    // 房间
+    getOrCreateRoomMeta,
+    setRoomName,
+    setRoomFill,
+    setRoomLabelPos,
+    structures,
     // 复制粘贴 / 层级
     copySelected,
     pasteAt,

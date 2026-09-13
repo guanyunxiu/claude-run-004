@@ -1,7 +1,7 @@
 /**
  * 命中检测：返回给定世界坐标下可选中的图元
  */
-import type { FloorElement, WallElement, DoorElement, WindowElement, FurnitureElement, DimensionElement } from '@/types'
+import type { FloorElement, WallElement, DoorElement, WindowElement, FurnitureElement, DimensionElement, StructureElement } from '@/types'
 import { bboxOf, pointInRect, pointPolylineDist, angleArc, type Pt } from './geometry'
 import { openingPlacement, type Opening } from './openings'
 
@@ -15,16 +15,26 @@ export interface HitResult {
   dist: number
 }
 
-function hitFurniture(f: FurnitureElement, p: Pt): boolean {
-  // 将世界点反旋转（-rotation）到家具局部坐标系，再做轴对齐矩形判定。
-  // 渲染时世界 = 局部绕中心旋转 +rotation，这里方向必须与之相反。
-  const dx = p.x - f.x
-  const dy = p.y - f.y
-  const c = Math.cos(-f.rotation)
-  const s = Math.sin(-f.rotation)
+/** 旋转矩形（家具/结构）命中：世界点反旋转到局部轴对齐判定 */
+function hitRotatedBox(
+  b: { x: number; y: number; width: number; height: number; rotation: number },
+  p: Pt
+): boolean {
+  const dx = p.x - b.x
+  const dy = p.y - b.y
+  const c = Math.cos(-b.rotation)
+  const s = Math.sin(-b.rotation)
   const lx = dx * c - dy * s
   const ly = dx * s + dy * c
-  return Math.abs(lx) <= f.width / 2 && Math.abs(ly) <= f.height / 2
+  return Math.abs(lx) <= b.width / 2 && Math.abs(ly) <= b.height / 2
+}
+
+function hitFurniture(f: FurnitureElement, p: Pt): boolean {
+  return hitRotatedBox(f, p)
+}
+
+function hitStructure(s: StructureElement, p: Pt): boolean {
+  return hitRotatedBox(s, p)
 }
 
 function hitAngleDimension(d: DimensionElement, p: Pt, tolMm: number): HitResult | null {
@@ -122,6 +132,8 @@ export function hitTest(elements: FloorElement[], p: Pt, tolMm: number): HitResu
     const el = elements[i]
     if (el.kind === 'furniture') {
       if (hitFurniture(el, p)) hits.push({ id: el.id, kind: 'furniture', dist: 0 })
+    } else if (el.kind === 'structure') {
+      if (hitStructure(el, p)) hits.push({ id: el.id, kind: 'structure', dist: 0 })
     } else if (el.kind === 'dimension') {
       const h = hitDimension(el, p, tolMm)
       if (h) hits.push(h)
@@ -146,6 +158,7 @@ export function hitTest(elements: FloorElement[], p: Pt, tolMm: number): HitResu
     window: 1,
     dimension: 2,
     furniture: 3,
+    structure: 3,
     wall: 4,
     'door-swing': 1
   }
@@ -159,7 +172,7 @@ export function boxSelect(elements: FloorElement[], rect: { x: number; y: number
   for (const el of elements) {
     if (el.kind === 'wall') {
       if (el.points.some((p) => pointInRect(p, rect))) ids.push(el.id)
-    } else if (el.kind === 'furniture') {
+    } else if (el.kind === 'furniture' || el.kind === 'structure') {
       const bb = bboxOf([
         { x: el.x - el.width / 2, y: el.y - el.height / 2 },
         { x: el.x + el.width / 2, y: el.y + el.height / 2 }

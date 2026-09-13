@@ -10,6 +10,7 @@ import WallShape from './WallShape.vue'
 import DoorShape from './DoorShape.vue'
 import WindowShape from './WindowShape.vue'
 import FurnitureShape from './FurnitureShape.vue'
+import StructureShape from './StructureShape.vue'
 import DimensionShape from './DimensionShape.vue'
 import type { WallElement } from '@/types'
 
@@ -45,6 +46,12 @@ const props = defineProps({
   <FurnitureShape
     v-else-if="el.kind === 'furniture'"
     :furniture="el"
+    :selected="selected"
+    :scale="scale"
+  />
+  <StructureShape
+    v-else-if="el.kind === 'structure'"
+    :el="el"
     :selected="selected"
     :scale="scale"
   />

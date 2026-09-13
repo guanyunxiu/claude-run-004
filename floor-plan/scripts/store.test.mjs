@@ -172,6 +172,32 @@ const rePasted = editor.pasteAt({ x: 0, y: 0 })
 check('剪切板内容可再次粘贴（墙+门成对）', rePasted.length === 2)
 check('粘贴后门窗依附重映射的新墙', rePasted.find((e) => e.kind === 'door').wallId === rePasted.find((e) => e.kind === 'wall').id)
 
+// Ctrl+D 快速副本：只选墙，副本必须自动带上依附的门窗
+reset()
+wall('dup1', [{ x: 0, y: 0 }, { x: 2000, y: 0 }])
+editor.addElement(
+  { id: 'dupd', kind: 'door', wallId: 'dup1', offset: 0, width: 800, hinge: 'start', swingSide: 1, color: '#000' },
+  false
+)
+editor.addElement(
+  { id: 'dupw', kind: 'window', wallId: 'dup1', offset: 1000, width: 600, color: '#000' },
+  false
+)
+editor.selectOnly(['dup1'])
+editor.duplicateSelected()
+{
+  const walls = state.doc.elements.filter((e) => e.kind === 'wall')
+  const doors = state.doc.elements.filter((e) => e.kind === 'door')
+  const wins = state.doc.elements.filter((e) => e.kind === 'window')
+  check('Ctrl+D 复制墙: 2 面墙', walls.length === 2, String(walls.length))
+  check('Ctrl+D 复制墙: 门/窗各 2（随墙带上）', doors.length === 2 && wins.length === 2, `door=${doors.length} win=${wins.length}`)
+  const newWall = walls.find((x) => x.id !== 'dup1')
+  const newDoor = doors.find((x) => x.id !== 'dupd')
+  const newWin = wins.find((x) => x.id !== 'dupw')
+  check('Ctrl+D: 副本门窗依附副本墙', newDoor.wallId === newWall.id && newWin.wallId === newWall.id)
+  check('Ctrl+D: 副本带 200 偏移', approx(newWall.points[0].x, 200))
+}
+
 // ----------------------------------------------------------- 6. 层级
 reset()
 const fa = editor.addElement({ id: 'fa', kind: 'furniture', defId: 'bed', x: 0, y: 0, width: 100, height: 100, rotation: 0 }, false)

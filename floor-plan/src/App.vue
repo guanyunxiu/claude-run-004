@@ -8,8 +8,9 @@ import TopBar from '@/components/TopBar.vue'
 import StatusBar from '@/components/StatusBar.vue'
 import { useEditor } from '@/store/useEditor'
 import { useViewport } from '@/composables/useViewport'
-import { getFurnitureDef } from '@/lib/furniture'
+import { getFurnitureDef, addCustomFurniture, normalizeCustomBody } from '@/lib/furniture'
 import type { Pt } from '@/lib/geometry'
+import type { StructureKind } from '@/types'
 
 const editor = useEditor()
 const canvasRef = ref<InstanceType<typeof CanvasView> | null>(null)
@@ -86,6 +87,52 @@ function placeFurniture(defId: string, world?: Pt) {
   editor.setMode('select')
   editor.selectOnly([f.id])
 }
+
+// 结构构件放置（视图中心 + 阶梯偏移）
+const structSeq = ref(0)
+function placeStructure(kind: StructureKind) {
+  if (!canvasRef.value) return
+  const el = canvasRef.value.containerRef as HTMLDivElement
+  const rect = el.getBoundingClientRect()
+  const cx = rect.left + rect.width / 2
+  const cy = rect.top + rect.height / 2
+  const w = useViewport().screenToWorld(cx, cy, rect)
+  const step = (structSeq.value % 6) * 120
+  editor.pushHistory()
+  const s = editor.makeStructure(kind, w.x + step, w.y + step)
+  editor.addElement(s, false)
+  structSeq.value++
+  editor.setMode('select')
+  editor.selectOnly([s.id])
+}
+
+// 自定义家具上传：读取 SVG 文件 + 弹框填写尺寸/名称
+const fileInput = ref<HTMLInputElement | null>(null)
+function onAddCustom() {
+  fileInput.value?.click()
+}
+function onCustomFile(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  const reader = new FileReader()
+  reader.onload = () => {
+    const raw = String(reader.result || '')
+    const body = normalizeCustomBody(raw)
+    if (!body) return
+    const name = window.prompt('家具名称', file.name.replace(/\.svg$/i, ''))
+    if (!name) return
+    const wStr = window.prompt('宽度（mm）', '800')
+    const hStr = window.prompt('深度（mm）', '600')
+    const width = Math.max(100, Number(wStr) || 800)
+    const height = Math.max(100, Number(hStr) || 600)
+    const id = `custom_${Date.now().toString(36)}`
+    addCustomFurniture({ id, name, width, height, body })
+    placeFurniture(id)
+  }
+  reader.readAsText(file)
+  input.value = ''
+}
 </script>
 
 <template>
@@ -100,7 +147,12 @@ function placeFurniture(defId: string, world?: Pt) {
     />
     <CanvasView ref="canvasRef" />
     <Toolbar />
-    <FurnitureLibrary @place="(p) => placeFurniture(p.defId)" />
+    <FurnitureLibrary
+      @place="(p) => placeFurniture(p.defId)"
+      @place-structure="(p) => placeStructure(p.kind)"
+      @add-custom="onAddCustom"
+    />
+    <input ref="fileInput" type="file" accept=".svg,image/svg+xml" style="display: none" @change="onCustomFile" />
     <PropertyPanel />
     <StatusBar />
   </div>

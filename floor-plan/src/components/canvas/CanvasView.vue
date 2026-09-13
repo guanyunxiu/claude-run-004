@@ -16,10 +16,12 @@ import { snapPoint, type SnapHit } from '@/lib/snapping'
 import { anchorFromSnap } from '@/lib/dimensionSync'
 import { hasClipboard } from '@/lib/clipboard'
 import { hitTest, boxSelect, type HitResult } from '@/lib/hit'
-import { clampOffset, openingPlacement, projectPointToWall } from '@/lib/openings'
-import { wallOutlinePath } from '@/lib/geometry'
+import { clampOffset, openingPlacement, projectPointToWall, nearestWallForOpening } from '@/lib/openings'
+import { wallOutlinePath, polygonCentroid } from '@/lib/geometry'
 import { uid } from '@/lib/uid'
 import { formatLength } from '@/lib/format'
+import { snapFurnitureToWalls, snapFurnitureToOthers } from '@/lib/layout'
+import { detectCollisions } from '@/lib/collision'
 import GridLayer from './GridLayer.vue'
 import Rulers from './Rulers.vue'
 import WorldElement from '@/components/svg/WorldElement.vue'
@@ -29,6 +31,8 @@ import type {
   DimensionElement,
   DoorElement,
   FurnitureElement,
+  RoomFace,
+  StructureElement,
   WallElement,
   WindowElement
 } from '@/types'
@@ -45,6 +49,26 @@ const hover = ref<HitResult | null>(null)
 const marquee = ref<{ x0: number; y0: number; x1: number; y1: number } | null>(null)
 const dimensionHover = ref<{ p1: Pt; p2: Pt } | null>(null)
 const angleDimHover = ref<{ vertex: Pt; r1: Pt; r2: Pt } | null>(null)
+
+/** 画布内轻量提示（如门窗放置位置不合法），自动消失 */
+const toastMsg = ref('')
+let toastTimer: ReturnType<typeof setTimeout> | null = null
+function toast(msg: string) {
+  toastMsg.value = msg
+  if (toastTimer) clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => (toastMsg.value = ''), 1600)
+}
+
+/** 靠墙/家具边缘吸附参考线（画布绘制） */
+const wallSnapGuide = ref<{ edge: 'x' | 'y'; at: number; kind: 'wall' | 'furniture' } | null>(null)
+const viewWorldL = -2_000_000
+const viewWorldR = 2_000_000
+const viewWorldT = -2_000_000
+const viewWorldB = 2_000_000
+/** 当前碰撞图元 id 集合（高亮警告） */
+const collisionIds = ref<Set<string>>(new Set())
+/** 正在移动的家具/结构起始位（用于碰撞禁止落下时回退） */
+let moveBoxOrigins: { id: string; x: number; y: number }[] = []
 
 /** 标记本次指针拖拽是否已提交历史快照（拖拽开始入栈一次） */
 let dragHistPushed = false
@@ -83,6 +107,16 @@ const wallMap = computed(() => new Map(walls.value.map((w) => [w.id, w])))
 /** 渲染顺序即文档数组顺序（层级调整据此生效，跨类型也成立） */
 const orderedElements = computed(() => state.doc.elements)
 
+/** 处于碰撞状态的家具/结构（用于红色警告框） */
+const collisionBoxes = computed(() =>
+  [...collisionIds.value]
+    .map((id) => state.doc.elements.find((e) => e.id === id))
+    .filter(
+      (e): e is FurnitureElement | StructureElement =>
+        !!e && (e.kind === 'furniture' || e.kind === 'structure')
+    )
+)
+
 // ---------------------------------------------------------------------------
 // 指针交互状态机
 // ---------------------------------------------------------------------------
@@ -106,6 +140,13 @@ type DragState =
     }
   | { kind: 'fur-rotate'; id: string; cx: number; cy: number; free: boolean }
   | { kind: 'fur-scale'; id: string; startWorld: Pt; w: number; h: number }
+  | {
+      kind: 'move-box'
+      ids: string[]
+      startWorld: Pt
+      origins: { id: string; x: number; y: number }[]
+    }
+  | { kind: 'room-label'; roomId: string; startWorld: Pt }
   | { kind: 'marquee'; x0: number; y0: number; additive: boolean }
   | { kind: 'measure-first'; p: Pt }
 
@@ -230,6 +271,64 @@ function onPointerDown(e: PointerEvent) {
 // 选择模式按下：命中检测 / 框选 / 各类拖拽
 // ---------------------------------------------------------------------------
 function handleSelectDown(e: PointerEvent, w: Pt) {
+  // Alt：墙体顶点编辑。Alt+点击墙身=插入顶点；Ctrl+Alt+点击顶点=删除；Shift+Alt+点击墙身=打断
+  if (e.altKey) {
+    const wallHit = hitTest(
+      state.doc.elements.filter((x) => x.kind === 'wall'),
+      w,
+      snapTolMm()
+    )
+    if (wallHit) {
+      const wallEl = editor.getElement(wallHit.id) as WallElement | undefined
+      if (wallEl) {
+        if (e.ctrlKey || e.metaKey) {
+          const vIdx = wallEl.points.findIndex((p) => Vec2.dist(p, w) <= snapTolMm())
+          if (vIdx >= 0 && editor.wallRemoveVertex(wallEl.id, vIdx)) toast('已删除顶点')
+        } else if (e.shiftKey) {
+          const nw = editor.splitWall(wallEl.id, w, snapTolMm())
+          if (nw) toast('已打断为两段墙')
+          else toast('请靠近墙线处打断')
+        } else {
+          const idx = editor.wallInsertVertex(wallEl.id, w, snapTolMm())
+          if (idx >= 0) {
+            editor.selectOnly([wallEl.id])
+            drag.current = { kind: 'wall-vertex', wallId: wallEl.id, index: idx, startWorld: w }
+            dragHistPushed = false // 插入已入栈，拖拽不要再入栈
+          }
+        }
+        return
+      }
+    }
+  }
+
+  // 优先检查已选中家具/结构的旋转/缩放手柄（位于本体外，hitTest 检测不到）
+  const furHandle = findFurnitureHandleAt(w)
+  if (furHandle) {
+    const f = editor.getElement(furHandle.id) as FurnitureElement | undefined
+    if (f) {
+      containerRef.value?.setPointerCapture?.(e.pointerId)
+      if (furHandle.handle === 'fur-rotate') {
+        drag.current = { kind: 'fur-rotate', id: f.id, cx: f.x, cy: f.y, free: e.shiftKey }
+      } else {
+        drag.current = { kind: 'fur-scale', id: f.id, startWorld: w, w: f.width, h: f.height }
+      }
+      return
+    }
+  }
+
+  // 房间标签拖拽（即使没点中图元也可能命中标签）
+  const roomAtLabel = findRoomLabelAt(w)
+  if (roomAtLabel) {
+    editor.selectOnly([])
+    editor.selectRoom(roomAtLabel.id)
+    containerRef.value?.setPointerCapture?.(e.pointerId)
+    dragHistPushed = false
+    drag.current = { kind: 'room-label', roomId: roomAtLabel.id, startWorld: w }
+    return
+  }
+  // 点中其它图元/空白时清除房间选中
+  if (state.selectedRoomId) editor.selectRoom(null)
+
   const hit = hitTest(state.doc.elements, w, snapTolMm())
   hover.value = hit
 
@@ -262,6 +361,11 @@ function handleSelectDown(e: PointerEvent, w: Pt) {
     }
   }
   if (el.kind === 'dimension') {
+    if (el.dimType === 'linear' && hit.kind === 'dimension' && hit.handle === 'offset') {
+      // 拖动标注线（偏移线）=> 改变偏移距离，而非整段平移
+      drag.current = { kind: 'dim-handle', id: el.id, handle: 'offset', startWorld: w }
+      return
+    }
     if (hit.kind === 'dim-handle' && hit.handle) {
       drag.current = {
         kind: 'dim-handle',
@@ -269,19 +373,6 @@ function handleSelectDown(e: PointerEvent, w: Pt) {
         handle: hit.handle as 'start' | 'end' | 'offset' | 'vertex' | 'ray1' | 'ray2' | 'arc',
         startWorld: w
       }
-      return
-    }
-  }
-  if (el.kind === 'furniture') {
-    // 旋转手柄（屏幕距离判定）
-    const rotHandle = furnitureRotHandle(el)
-    if (rotHandle && Vec2.dist(rotHandle, w) <= snapTolMm() * 1.2) {
-        drag.current = { kind: 'fur-rotate', id: el.id, cx: el.x, cy: el.y, free: e.shiftKey }
-      return
-    }
-    const scHandle = furnitureScaleHandle(el)
-    if (scHandle && Vec2.dist(scHandle, w) <= snapTolMm() * 1.2) {
-        drag.current = { kind: 'fur-scale', id: el.id, startWorld: w, w: el.width, h: el.height }
       return
     }
   }
@@ -293,6 +384,7 @@ function handleSelectDown(e: PointerEvent, w: Pt) {
   // 整体移动（墙、家具、标注）
   beginDragMutation()
   const ids = state.selection.has(el.id) ? [...state.selection] : [el.id]
+  moveBoxOrigins = []
   const origins = ids
     .map((id) => editor.getElement(id))
     .filter((x): x is NonNullable<typeof x> => !!x)
@@ -300,7 +392,8 @@ function handleSelectDown(e: PointerEvent, w: Pt) {
       if (x.kind === 'wall') {
         return { id: x.id, x: 0, y: 0, points: x.points.map((p) => ({ ...p })) }
       }
-      if (x.kind === 'furniture') {
+      if (x.kind === 'furniture' || x.kind === 'structure') {
+        moveBoxOrigins.push({ id: x.id, x: x.x, y: x.y })
         return { id: x.id, x: x.x, y: x.y }
       }
       if (x.kind === 'dimension') {
@@ -315,20 +408,50 @@ function handleSelectDown(e: PointerEvent, w: Pt) {
   drag.current = { kind: 'move', ids, startWorld: w, origins }
 }
 
-function furnitureRotHandle(f: FurnitureElement): Pt | null {
-  // 与 FurnitureShape 中手柄位置一致（未旋转世界坐标）
+function furnitureRotHandle(f: { x: number; y: number; width: number; height: number; rotation: number }): Pt {
   const lx = 0
   const ly = -f.height / 2 - 26 / state.viewport.scale
   const c = Math.cos(f.rotation)
   const s = Math.sin(f.rotation)
   return { x: lx * c - ly * s + f.x, y: lx * s + ly * c + f.y }
 }
-function furnitureScaleHandle(f: FurnitureElement): Pt | null {
+function furnitureScaleHandle(f: { x: number; y: number; width: number; height: number; rotation: number }): Pt {
   const lx = f.width / 2 + 6 / state.viewport.scale
   const ly = f.height / 2 + 6 / state.viewport.scale
   const c = Math.cos(f.rotation)
   const s = Math.sin(f.rotation)
   return { x: lx * c - ly * s + f.x, y: lx * s + ly * c + f.y }
+}
+
+/**
+ * 命中家具/结构的旋转/缩放手柄。手柄位于本体外，hitTest 只判本体内部，
+ * 因此必须在进入框选/点选分支之前单独检查（仅对已选中、手柄可见的图元）。
+ * 命中半径约 18px，手柄容易点中。
+ */
+function findFurnitureHandleAt(p: Pt): { id: string; handle: 'fur-rotate' | 'fur-scale' } | null {
+  const hitR = 9 / state.viewport.scale
+  const items = state.doc.elements.filter(
+    (e): e is FurnitureElement | StructureElement =>
+      (e.kind === 'furniture' || e.kind === 'structure') && state.selection.has(e.id)
+  )
+  for (let i = items.length - 1; i >= 0; i--) {
+    const f = items[i]
+    const sc = furnitureScaleHandle(f)
+    if (sc && Vec2.dist(sc, p) <= hitR) return { id: f.id, handle: 'fur-scale' }
+    const rot = furnitureRotHandle(f)
+    if (rot && Vec2.dist(rot, p) <= hitR) return { id: f.id, handle: 'fur-rotate' }
+  }
+  return null
+}
+
+/** 命中房间标签（用于拖动标签位置） */
+function findRoomLabelAt(p: Pt): RoomFace | null {
+  const hitR = Math.max(120, 14 / state.viewport.scale)
+  for (const room of editor.rooms.value) {
+    const pos = room.meta?.labelPos ?? polygonCentroid(room.points)
+    if (pos && Vec2.dist(pos, p) <= hitR) return room
+  }
+  return null
 }
 
 // ---------------------------------------------------------------------------
@@ -402,17 +525,14 @@ function finishWall(closed: boolean) {
 // 门窗放置
 // ---------------------------------------------------------------------------
 function placeOpening(e: PointerEvent, w: Pt, kind: 'door' | 'window') {
-  // 找最近的墙
-  let bestWall: WallElement | null = null
-  let best: ReturnType<typeof projectPointToWall> = null
-  for (const wall of walls.value) {
-    const rr = projectPointToWall(w, wall)
-    if (rr && (!best || rr.dist < best.dist)) {
-      best = rr
-      bestWall = wall
-    }
+  // 找最近且足够靠近的墙；离墙太远不允许放置
+  const hitWall = nearestWallForOpening(w, walls.value)
+  if (!hitWall) {
+    toast(kind === 'door' ? '请在靠近墙体处放置门' : '请在靠近墙体处放置窗')
+    return
   }
-  if (!bestWall || !best) return
+  const bestWall = hitWall.wall
+  const best = hitWall.proj
   const width = kind === 'door' ? 800 : 1200
   const offset = clampOffset(bestWall, best.offset - width / 2, width)
   const id = uid(kind)
@@ -594,6 +714,9 @@ function onPointerMove(e: PointerEvent) {
     case 'fur-scale':
       doFurScale(e, w, d)
       break
+    case 'room-label':
+      doRoomLabel(w, d)
+      break
   }
 
   if (state.mode === 'select' && d.kind === 'none') {
@@ -605,12 +728,18 @@ function doMove(w: Pt, d: Extract<DragState, { kind: 'move' }>) {
   beginDragMutation()
   const dx = w.x - d.startWorld.x
   const dy = w.y - d.startWorld.y
+  // 家具/结构整体移动：先从 origins 平移，再做靠墙吸附/碰撞
+  const boxIds = d.origins.filter((o) => {
+    const el0 = editor.getElement(o.id)
+    return el0 && (el0.kind === 'furniture' || el0.kind === 'structure')
+  }).map((o) => o.id)
+  collisionIds.value = new Set()
   for (const o of d.origins) {
     const el = editor.getElement(o.id)
     if (!el) continue
     if (el.kind === 'wall' && o.points) {
       el.points = o.points.map((p) => ({ x: p.x + dx, y: p.y + dy }))
-    } else if (el.kind === 'furniture') {
+    } else if (el.kind === 'furniture' || el.kind === 'structure') {
       el.x = o.x + dx
       el.y = o.y + dy
     } else if (el.kind === 'dimension') {
@@ -620,12 +749,10 @@ function doMove(w: Pt, d: Extract<DragState, { kind: 'move' }>) {
         el.ray2 = { x: o.p2.x + dx, y: o.p2.y + dy }
         el.p1 = { ...el.ray1 }
         el.p2 = { ...el.ray2 }
-        // 手动平移后解除墙关联
         el.refV = { kind: 'free' }
         el.ref1 = { kind: 'free' }
         el.ref2 = { kind: 'free' }
       } else if (o.p1 && o.p2) {
-        // 从起始绝对位置整体平移，避免每帧增量叠加
         el.p1 = { x: o.p1.x + dx, y: o.p1.y + dy }
         el.p2 = { x: o.p2.x + dx, y: o.p2.y + dy }
         el.ref1 = { kind: 'free' }
@@ -633,6 +760,20 @@ function doMove(w: Pt, d: Extract<DragState, { kind: 'move' }>) {
       }
     }
   }
+  // 单选家具/结构时做靠墙吸附 + 碰撞高亮；多选纯平移
+  if (boxIds.length === 1) {
+    const el = editor.getElement(boxIds[0]) as FurnitureElement | StructureElement
+    if (el) updateMoveBoxGuides(el)
+  } else {
+    wallSnapGuide.value = null
+  }
+}
+
+/** 房间标签拖拽 */
+function doRoomLabel(w: Pt, d: Extract<DragState, { kind: 'room-label' }>) {
+  beginDragMutation()
+  const room = editor.rooms.value.find((r) => r.id === d.roomId)
+  if (room) editor.setRoomLabelPos(room, w)
 }
 
 function doWallVertex(e: PointerEvent, w: Pt, d: Extract<DragState, { kind: 'wall-vertex' }>) {
@@ -735,7 +876,7 @@ function doDimHandle(w: Pt, d: Extract<DragState, { kind: 'dim-handle' }>) {
 
 function doFurRotate(e: PointerEvent, w: Pt, d: Extract<DragState, { kind: 'fur-rotate' }>) {
   beginDragMutation()
-  const el = editor.getElement(d.id) as FurnitureElement | undefined
+  const el = editor.getElement(d.id) as (FurnitureElement | StructureElement) | undefined
   if (!el) return
   const ang = Math.atan2(w.y - d.cy, w.x - d.cx)
   // 默认吸附 15°；Shift 或拖拽起始即为自由模式时不吸附（自由角度微调）
@@ -754,24 +895,56 @@ function doFurScale(
   d: Extract<DragState, { kind: 'fur-scale' }>
 ) {
   beginDragMutation()
-  const el = editor.getElement(d.id) as FurnitureElement | undefined
+  const el = editor.getElement(d.id) as (FurnitureElement | StructureElement) | undefined
   if (!el) return
-  // 将鼠标位置变换到家具局部坐标
+  // 将鼠标位置变换到局部坐标
   const c = Math.cos(-el.rotation)
   const s = Math.sin(-el.rotation)
   const lx = (w.x - el.x) * c - (w.y - el.y) * s
-  void e
-  let nw = Math.max(200, Math.abs(lx) * 2)
+  let nw = Math.max(80, Math.abs(lx) * 2)
   let nh = d.h
   if (e.shiftKey) {
-    // 等比
     nh = d.h * (nw / d.w)
   } else {
     const ly = (w.x - el.x) * s + (w.y - el.y) * c
-    nh = Math.max(200, Math.abs(ly) * 2)
+    nh = Math.max(80, Math.abs(ly) * 2)
   }
   el.width = nw
   el.height = nh
+}
+
+/** 拖动家具/结构时：靠墙/家具边缘吸附 + 碰撞检测 */
+function updateMoveBoxGuides(el: FurnitureElement | StructureElement) {
+  wallSnapGuide.value = null
+  collisionIds.value = new Set()
+  const s = state.doc.settings
+  const tol = 40 / state.viewport.scale
+
+  if (s.furnitureSnap) {
+    const otherMovables = state.doc.elements.filter(
+      (x): x is FurnitureElement | StructureElement =>
+        (x.kind === 'furniture' || x.kind === 'structure') && x.id !== el.id
+    )
+    // 候选：靠墙吸附 vs 靠家具吸附，取需要位移更小者
+    const gW = snapFurnitureToWalls(el, walls.value, tol)
+    const gO = snapFurnitureToOthers(el, otherMovables, tol)
+    const use = gW && gO ? (Math.hypot(gW.x - el.x, gW.y - el.y) <= Math.hypot(gO.x - el.x, gO.y - el.y) ? gW : gO) : gW ?? gO
+    if (use) {
+      el.x = use.x
+      el.y = use.y
+      wallSnapGuide.value = { edge: use.edge, at: use.at, kind: use.kind }
+    }
+  }
+
+  // 碰撞检测（吸附后的最终位置）
+  const box = { x: el.x, y: el.y, width: el.width, height: el.height, rotation: el.rotation }
+  const otherBoxes = state.doc.elements
+    .filter((x): x is FurnitureElement | StructureElement =>
+      (x.kind === 'furniture' || x.kind === 'structure') && x.id !== el.id)
+    .map((x) => ({ id: x.id, box: { x: x.x, y: x.y, width: x.width, height: x.height, rotation: x.rotation } }))
+  const report = detectCollisions(box, el.id, { walls: walls.value, boxes: otherBoxes })
+  collisionIds.value = new Set(report.targets)
+  return report.hasCollision
 }
 
 // ---------------------------------------------------------------------------
@@ -799,8 +972,23 @@ function onPointerUp(e: PointerEvent) {
     marquee.value = null
   }
 
+  // 家具/结构移动结束：碰撞禁止落下时回退到起始位
+  if (d.kind === 'move' && state.doc.settings.collisionBlock && collisionIds.value.size > 0) {
+    for (const o of moveBoxOrigins) {
+      const el = editor.getElement(o.id) as FurnitureElement | StructureElement | undefined
+      if (el && (el.kind === 'furniture' || el.kind === 'structure')) {
+        el.x = o.x
+        el.y = o.y
+      }
+    }
+    toast('与墙体或其他家具重叠，已阻止放置')
+  }
+
   // 非绘制拖拽结束后清除吸附标记
   if (state.mode === 'select') rawState.snapMarker = null
+  wallSnapGuide.value = null
+  collisionIds.value = new Set()
+  moveBoxOrigins = []
   drag.current = { kind: 'none' }
   void e
 }
@@ -843,6 +1031,7 @@ function onKeyDown(e: KeyboardEvent) {
     rawState.snapMarker = null
     dimensionHover.value = null
     angleDimHover.value = null
+    editor.selectRoom(null)
     if (state.mode !== 'select') editor.setMode('select')
     return
   }
@@ -1052,7 +1241,7 @@ function fitAll() {
   const pts: Pt[] = []
   for (const el of state.doc.elements) {
     if (el.kind === 'wall') pts.push(...el.points)
-    else if (el.kind === 'furniture')
+    else if (el.kind === 'furniture' || el.kind === 'structure')
       pts.push(
         { x: el.x - el.width, y: el.y - el.height },
         { x: el.x + el.width, y: el.y + el.height }
@@ -1158,7 +1347,13 @@ function inRect(p: Pt, r: { x: number; y: number; width: number; height: number 
         <OpeningsMask :walls="walls" :doors="doors" :windows="windows" />
 
         <!-- 房间面（最底层） -->
-        <RoomFaceShape v-for="r in editor.rooms.value" :key="r.id" :room="r" :scale="scale" />
+        <RoomFaceShape
+          v-for="r in editor.rooms.value"
+          :key="r.id"
+          :room="r"
+          :scale="scale"
+          :selected="state.selectedRoomId === r.id"
+        />
 
         <!-- 所有图元：严格按 elements 数组顺序绘制，数组顺序即层级 -->
         <WorldElement
@@ -1168,6 +1363,35 @@ function inRect(p: Pt, r: { x: number; y: number; width: number; height: number 
           :selected="state.selection.has(el.id)"
           :scale="scale"
           :wall-map="wallMap"
+        />
+
+        <!-- 碰撞警告框（红色虚线） -->
+        <g v-for="b in collisionBoxes" :key="'col-' + b.id" data-export-hidden>
+          <g :transform="`translate(${b.x} ${b.y}) rotate(${(b.rotation * 180) / Math.PI})`">
+            <rect
+              :x="-b.width / 2 - 6 / scale"
+              :y="-b.height / 2 - 6 / scale"
+              :width="b.width + 12 / scale"
+              :height="b.height + 12 / scale"
+              fill="rgba(245,108,108,0.12)"
+              stroke="#f56c6c"
+              :stroke-width="2.4 / scale"
+              :stroke-dasharray="`${8 / scale} ${5 / scale}`"
+            />
+          </g>
+        </g>
+
+        <!-- 靠墙/家具边缘吸附参考线 -->
+        <line
+          v-if="wallSnapGuide"
+          data-export-hidden
+          :x1="wallSnapGuide.edge === 'x' ? wallSnapGuide.at : viewWorldL"
+          :y1="wallSnapGuide.edge === 'y' ? wallSnapGuide.at : viewWorldT"
+          :x2="wallSnapGuide.edge === 'x' ? wallSnapGuide.at : viewWorldR"
+          :y2="wallSnapGuide.edge === 'y' ? wallSnapGuide.at : viewWorldB"
+          stroke="#67c23a"
+          :stroke-width="1.5 / scale"
+          stroke-dasharray="6 4"
         />
 
         <!-- 画墙预览 -->
@@ -1395,6 +1619,11 @@ function inRect(p: Pt, r: { x: number; y: number; width: number; height: number 
       :view-h="viewH - rulerSize"
       :size="rulerSize"
     />
+
+    <!-- 画布提示（屏幕层） -->
+    <transition name="toast-fade">
+      <div v-if="toastMsg" class="canvas-toast">{{ toastMsg }}</div>
+    </transition>
   </div>
 </template>
 
@@ -1424,5 +1653,29 @@ function inRect(p: Pt, r: { x: number; y: number; width: number; height: number 
 }
 .cursor-crosshair {
   cursor: crosshair;
+}
+.canvas-toast {
+  position: absolute;
+  top: 64px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  background: rgba(245, 108, 108, 0.95);
+  color: #fff;
+  font-size: 13px;
+  padding: 8px 18px;
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+  pointer-events: none;
+  white-space: nowrap;
+}
+.toast-fade-enter-active,
+.toast-fade-leave-active {
+  transition: opacity 0.18s, transform 0.18s;
+}
+.toast-fade-enter-from,
+.toast-fade-leave-to {
+  opacity: 0;
+  transform: translateX(-50%) translateY(-6px);
 }
 </style>

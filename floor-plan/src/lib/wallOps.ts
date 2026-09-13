@@ -562,3 +562,225 @@ export function rehomeOpenings(
   }
   return orphan
 }
+
+// ===========================================================================
+// 手动墙编辑：插入/删除顶点、打断、手动合并
+// ===========================================================================
+
+/** 在墙的某条边上距 p 最近处插入顶点，返回新顶点序号；未命中返回 -1 */
+export function insertVertex(wall: WallElement, p: Pt, tolMm: number): number {
+  if (wall.closed) {
+    // 闭合墙在边上插入：把点插入到边的后一个顶点位置，保持闭合
+    const n = wall.points.length
+    let best = { i: -1, t: 0, d: Infinity }
+    for (let i = 0; i < n; i++) {
+      const a = wall.points[i]
+      const b = wall.points[(i + 1) % n]
+      const r = pointSegInfo(p, a, b)
+      if (r.dist < best.d) best = { i, t: r.t, d: r.dist }
+    }
+    if (best.d > tolMm || best.i < 0) return -1
+    const a = wall.points[best.i]
+    const b = wall.points[(best.i + 1) % n]
+    const np = { x: a.x + (b.x - a.x) * best.t, y: a.y + (b.y - a.y) * best.t }
+    wall.points.splice(best.i + 1, 0, np)
+    return best.i + 1
+  }
+  let best = { i: -1, t: 0, d: Infinity }
+  for (let i = 0; i < wall.points.length - 1; i++) {
+    const r = pointSegInfo(p, wall.points[i], wall.points[i + 1])
+    if (r.dist < best.d) best = { i, t: r.t, d: r.dist }
+  }
+  if (best.d > tolMm || best.i < 0) return -1
+  const a = wall.points[best.i]
+  const b = wall.points[best.i + 1]
+  const np = { x: a.x + (b.x - a.x) * best.t, y: a.y + (b.y - a.y) * best.t }
+  wall.points.splice(best.i + 1, 0, np)
+  return best.i + 1
+}
+
+/** 删除中间顶点（开放墙至少保留 2 点，闭合墙至少 3 点），返回是否删除 */
+export function removeVertex(wall: WallElement, index: number): boolean {
+  const minPts = wall.closed ? 3 : 2
+  if (wall.points.length <= minPts) return false
+  if (index < 0 || index >= wall.points.length) return false
+  wall.points.splice(index, 1)
+  return true
+}
+
+export interface SplitResult {
+  /** 打断点（世界坐标） */
+  point: Pt
+  /** 沿墙距离 mm */
+  dist: number
+  segIndex: number
+}
+
+/** 找到 p 在墙上的打断位置（最近边投影），超出容差返回 null */
+export function findSplitPoint(wall: WallElement, p: Pt, tolMm: number): SplitResult | null {
+  let acc = 0
+  const n = wall.closed ? wall.points.length : wall.points.length - 1
+  let best: (SplitResult & { d: number }) | null = null
+  for (let i = 0; i < n; i++) {
+    const a = wall.points[i]
+    const b = wall.points[(i + 1) % wall.points.length]
+    const r = pointSegInfo(p, a, b)
+    if (r.dist <= tolMm && (!best || r.dist < best.d)) {
+      best = {
+        point: { x: a.x + (b.x - a.x) * r.t, y: a.y + (b.y - a.y) * r.t },
+        dist: acc + r.t * Vec2.dist(a, b),
+        segIndex: i,
+        d: r.dist
+      }
+    }
+    acc += Vec2.dist(a, b)
+  }
+  return best
+}
+
+/**
+ * 在指定沿墙距离处把一面开放墙打断成两面墙。
+ * 门窗按 offset 归属到对应半墙并重映射；返回新墙（原墙被截断为前半段）。
+ */
+export function splitWallAt(
+  wall: WallElement,
+  dist: number,
+  point: Pt,
+  openings: OpeningLike[],
+  genId: () => string
+): WallElement {
+  const total = polylineLength(wall.points, false)
+  // 收集前半段点（在 dist 之前的顶点）+ 打断点
+  const ptsA: Pt[] = []
+  const ptsB: Pt[] = []
+  let acc = 0
+  ptsA.push({ ...wall.points[0] })
+  let passed = false
+  for (let i = 0; i < wall.points.length - 1; i++) {
+    const a = wall.points[i]
+    const b = wall.points[i + 1]
+    const len = Vec2.dist(a, b)
+    if (!passed && acc + len >= dist - EPS) {
+      ptsA.push({ ...point })
+      ptsB.push({ ...point })
+      // dist 之后的顶点归入 B
+      for (let j = i + 1; j < wall.points.length; j++) ptsB.push({ ...wall.points[j] })
+      passed = true
+      break
+    }
+    ptsA.push({ ...b })
+    acc += len
+  }
+  const lenA = dist
+  const lenB = total - dist
+
+  const newWall: WallElement = {
+    id: genId(),
+    kind: 'wall',
+    points: ptsB.length >= 2 ? ptsB : [{ ...point }, { ...wall.points[wall.points.length - 1] }],
+    closed: false,
+    thickness: wall.thickness,
+    color: wall.color
+  }
+  wall.points = ptsA
+  wall.closed = false
+
+  // 门窗归属：洞口中点 < dist => 留在 A；否则迁到 B（offset 减去 lenA）
+  for (const op of openings) {
+    const mid = op.offset + op.width / 2
+    if (mid >= lenA - EPS) {
+      op.wallId = newWall.id
+      op.offset = Math.max(0, op.offset - lenA)
+    }
+  }
+  void lenB
+  return newWall
+}
+
+/** 两面开放墙是否可在端点处合并（共享端点或端点在容差内） */
+export function canJoinWalls(a: WallElement, b: WallElement, tolMm: number): boolean {
+  if (a.closed || b.closed) return false
+  if (Math.abs(a.thickness - b.thickness) > EPS) return false
+  const ae = [a.points[0], a.points[a.points.length - 1]]
+  const be = [b.points[0], b.points[b.points.length - 1]]
+  for (const x of ae) for (const y of be) if (Vec2.dist(x, y) <= tolMm) return true
+  return false
+}
+
+export interface ManualJoinResult {
+  wall: WallElement
+  removedId: string
+}
+
+/**
+ * 手动合并两面开放墙（端点相接即可，允许折线、不要求共线）。
+ * 依附被并墙 b 的门窗 offset 重映射到合并墙；返回保留墙 a（已修改）与被删 id。
+ */
+export function joinWalls(
+  a: WallElement,
+  b: WallElement,
+  openings: OpeningLike[]
+): ManualJoinResult | null {
+  if (a.closed || b.closed) return null
+  const a0 = a.points[0]
+  const a1 = a.points[a.points.length - 1]
+  const b0 = b.points[0]
+  const b1 = b.points[b.points.length - 1]
+  const D = (p: Pt, q: Pt) => Vec2.dist(p, q)
+  // 选择连接组合，使拼接点为 a 端与 b 端
+  let aPts = a.points
+  let bPts = b.points
+  let joinAEnd: 0 | 1 = 1
+  let joinBEnd: 0 | 1 = 0
+  let best = Infinity
+  const combos: [0 | 1, 0 | 1][] = [
+    [1, 0],
+    [1, 1],
+    [0, 0],
+    [0, 1]
+  ]
+  for (const [ea, eb] of combos) {
+    const pa = ea === 0 ? a0 : a1
+    const pb = eb === 0 ? b0 : b1
+    const d = D(pa, pb)
+    if (d < best) {
+      best = d
+      joinAEnd = ea
+      joinBEnd = eb
+    }
+  }
+  aPts = joinAEnd === 0 ? [...a.points].reverse() : a.points.map((p) => ({ ...p }))
+  // b 需要从连接端开始走向另一端
+  bPts = (joinBEnd === 0 ? b.points : [...b.points].reverse()).map((p) => ({ ...p }))
+  // 拼接点统一用 a 的端点坐标，去掉 b 的首点
+  const merged = [...aPts, ...bPts.slice(1)]
+  const lenA = polylineLength(aPts, false)
+  const lenB = polylineLength(bPts, false)
+  // a 被反向时，依附 a 的门窗 offset 翻转
+  const aReversed = joinAEnd === 0
+  for (const op of openings) {
+    if (op.wallId === b.id) {
+      // bPts 沿走向 offset 即原 b offset（joinBEnd=0 正向；=1 反向）
+      const along = joinBEnd === 0 ? op.offset : lenB - op.width - op.offset
+      op.wallId = a.id
+      op.offset = lenA + along
+    } else if (op.wallId === a.id && aReversed) {
+      op.offset = lenA - op.width - op.offset
+    }
+  }
+  a.points = merged
+  a.closed = false
+  return { wall: a, removedId: b.id }
+}
+
+/** 点到线段信息：最近距离与参数 t */
+function pointSegInfo(p: Pt, a: Pt, b: Pt): { dist: number; t: number } {
+  const rx = b.x - a.x
+  const ry = b.y - a.y
+  const l2 = rx * rx + ry * ry
+  let t = l2 === 0 ? 0 : ((p.x - a.x) * rx + (p.y - a.y) * ry) / l2
+  t = Math.max(0, Math.min(1, t))
+  const qx = a.x + rx * t
+  const qy = a.y + ry * t
+  return { dist: Math.hypot(p.x - qx, p.y - qy), t }
+}

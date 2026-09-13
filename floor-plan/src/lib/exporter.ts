@@ -18,7 +18,7 @@ export function contentBBox(elements: FloorElement[], pad = 400) {
   const pts: Pt[] = []
   for (const el of elements) {
     if (el.kind === 'wall') pts.push(...el.points)
-    else if (el.kind === 'furniture')
+    else if (el.kind === 'furniture' || el.kind === 'structure')
       pts.push(
         { x: el.x - el.width / 2, y: el.y - el.height / 2 },
         { x: el.x + el.width / 2, y: el.y + el.height / 2 }

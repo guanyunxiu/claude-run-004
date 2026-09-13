@@ -95,3 +95,28 @@ export function clampOffset(wall: WallElement, offset: number, width: number): n
   const total = polylineLength(wall.points, wall.closed)
   return Math.max(0, Math.min(offset, Math.max(0, total - width)))
 }
+
+/** 距墙中心线超过该值（半墙厚之外）则不允许放置门窗 */
+export const OPENING_PLACE_GAP = 250
+
+/**
+ * 在所有墙中找距 p 最近的投影，且必须足够靠近某面墙才返回。
+ * 用于门窗放置：离墙太远时返回 null，不允许凭空放置。
+ */
+export function nearestWallForOpening(
+  p: Pt,
+  walls: WallElement[]
+): { wall: WallElement; proj: NonNullable<ReturnType<typeof projectPointToWall>> } | null {
+  let bestWall: WallElement | null = null
+  let best: ReturnType<typeof projectPointToWall> = null
+  for (const wall of walls) {
+    const r = projectPointToWall(p, wall)
+    if (r && (!best || r.dist < best.dist)) {
+      best = r
+      bestWall = wall
+    }
+  }
+  if (!bestWall || !best) return null
+  if (best.dist > bestWall.thickness / 2 + OPENING_PLACE_GAP) return null
+  return { wall: bestWall, proj: best }
+}
